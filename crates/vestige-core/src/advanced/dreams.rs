@@ -1679,10 +1679,10 @@ impl MemoryDreamer {
     fn store_connections(&self, connections: &[DiscoveredConnection]) {
         if let Ok(mut stored) = self.connections.write() {
             stored.extend(connections.iter().cloned());
-            // Keep last 1000 connections
+            // Keep last 100,000 connections (caller handles top-N selection)
             let len = stored.len();
-            if len > 1000 {
-                stored.drain(0..(len - 1000));
+            if len > 100_000 {
+                stored.drain(0..(len - 100_000));
             }
         }
     }

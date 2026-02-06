@@ -50,6 +50,10 @@ enum Commands {
         /// Minimum similarity threshold for connection discovery (0.0-1.0, default: 0.85)
         #[arg(long, default_value = "0.85")]
         min_similarity: f64,
+
+        /// Maximum connections to persist, ranked by strength (default: 5000)
+        #[arg(long, default_value = "5000")]
+        max_connections: usize,
     },
 
     /// Restore memories from backup file
@@ -68,7 +72,8 @@ fn main() -> anyhow::Result<()> {
         Commands::Consolidate {
             deep,
             min_similarity,
-        } => run_consolidate(deep, min_similarity),
+            max_connections,
+        } => run_consolidate(deep, min_similarity, max_connections),
         Commands::Restore { file } => run_restore(file),
     }
 }
@@ -392,7 +397,7 @@ fn run_health() -> anyhow::Result<()> {
 }
 
 /// Run consolidation cycle
-fn run_consolidate(deep: bool, min_similarity: f64) -> anyhow::Result<()> {
+fn run_consolidate(deep: bool, min_similarity: f64, max_connections: usize) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
     println!("Running memory consolidation cycle...");
@@ -523,9 +528,27 @@ fn run_consolidate(deep: bool, min_similarity: f64) -> anyhow::Result<()> {
             dream_result.duration_ms
         );
 
-        // Persist discovered connections to the database
+        // Sort connections by strength DESC and persist top-N
+        let mut sorted_connections = discovered_connections;
+        sorted_connections.sort_by(|a, b| {
+            b.similarity
+                .partial_cmp(&a.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let to_persist = sorted_connections
+            .iter()
+            .take(max_connections)
+            .collect::<Vec<_>>();
+
+        println!(
+            "  Persisting top {} connections (of {} discovered)...",
+            to_persist.len(),
+            sorted_connections.len()
+        );
+
         let mut connections_saved = 0;
-        for conn in &discovered_connections {
+        let mut connections_failed = 0;
+        for conn in &to_persist {
             let now = Utc::now();
             let record = ConnectionRecord {
                 source_id: conn.from_id.clone(),
@@ -536,8 +559,9 @@ fn run_consolidate(deep: bool, min_similarity: f64) -> anyhow::Result<()> {
                 last_activated: now,
                 activation_count: 1,
             };
-            if storage.save_connection(&record).is_ok() {
-                connections_saved += 1;
+            match storage.save_connection(&record) {
+                Ok(_) => connections_saved += 1,
+                Err(_) => connections_failed += 1,
             }
         }
 
@@ -568,6 +592,21 @@ fn run_consolidate(deep: bool, min_similarity: f64) -> anyhow::Result<()> {
             "Connections Saved".green().bold(),
             connections_saved
         );
+        if connections_failed > 0 {
+            println!(
+                "{}: {} (likely DB lock contention with MCP server)",
+                "Connections Failed".red().bold(),
+                connections_failed
+            );
+        }
+        if let (Some(strongest), Some(weakest)) = (to_persist.first(), to_persist.last()) {
+            println!(
+                "{}: {:.3} - {:.3}",
+                "Strength Range".white().bold(),
+                strongest.similarity,
+                weakest.similarity
+            );
+        }
         println!("{}: {}", "Insights Saved".green().bold(), insights_saved);
 
         // Display generated insights

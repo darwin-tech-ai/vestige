@@ -8,6 +8,7 @@
 
 // Active unified tools
 pub mod codebase_unified;
+pub mod dream_unified;
 pub mod ingest;
 pub mod intention_unified;
 pub mod memory_unified;

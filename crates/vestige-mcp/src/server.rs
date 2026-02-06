@@ -167,6 +167,11 @@ impl McpServer {
             // Feedback tools
             // ================================================================
             ToolDescription {
+                name: "dream".to_string(),
+                description: Some("Dream cycle results for LLM synthesis. Actions: 'explore' (walk connection graph from a memory), 'clusters' (find groups of related memories for synthesis), 'insights' (get stored insights). Use 'clusters' to get raw memory content that you can synthesize into meaningful insights.".to_string()),
+                input_schema: tools::dream_unified::schema(),
+            },
+            ToolDescription {
                 name: "promote_memory".to_string(),
                 description: Some("Promote a memory (thumbs up). Use when a memory led to a good outcome. Increases retrieval strength so it surfaces more often.".to_string()),
                 input_schema: tools::feedback::promote_schema(),
@@ -200,6 +205,11 @@ impl McpServer {
             "memory" => tools::memory_unified::execute(&self.storage, request.arguments).await,
             "codebase" => tools::codebase_unified::execute(&self.storage, request.arguments).await,
             "intention" => tools::intention_unified::execute(&self.storage, request.arguments).await,
+
+            // ================================================================
+            // Dream cycle (LLM synthesis)
+            // ================================================================
+            "dream" => tools::dream_unified::execute(&self.storage, request.arguments).await,
 
             // ================================================================
             // Core memory tools
@@ -713,8 +723,8 @@ mod tests {
         let result = response.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
 
-        // v1.1+: Only 8 tools are exposed (deprecated tools work internally but aren't listed)
-        assert_eq!(tools.len(), 8, "Expected exactly 8 tools in v1.1+");
+        // v1.1+: Only 9 tools are exposed (deprecated tools work internally but aren't listed)
+        assert_eq!(tools.len(), 9, "Expected exactly 9 tools in v1.1+");
 
         let tool_names: Vec<&str> = tools
             .iter()

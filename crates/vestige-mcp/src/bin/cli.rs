@@ -4,9 +4,12 @@
 
 use std::path::PathBuf;
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use vestige_core::{IngestInput, Storage};
+use vestige_core::{
+    ConnectionRecord, DreamMemory, IngestInput, InsightRecord, MemoryDreamer, Storage,
+};
 
 /// Vestige - Cognitive Memory System CLI
 #[derive(Parser)]
@@ -14,7 +17,9 @@ use vestige_core::{IngestInput, Storage};
 #[command(author = "samvallad33")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "CLI for the Vestige cognitive memory system")]
-#[command(long_about = "Vestige is a cognitive memory system based on 130 years of memory research.\n\nIt implements FSRS-6, spreading activation, synaptic tagging, and more.")]
+#[command(
+    long_about = "Vestige is a cognitive memory system based on 130 years of memory research.\n\nIt implements FSRS-6, spreading activation, synaptic tagging, and more."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -37,7 +42,11 @@ enum Commands {
     Health,
 
     /// Run memory consolidation cycle
-    Consolidate,
+    Consolidate {
+        /// Run deep consolidation: dream cycle with connection discovery and insight generation
+        #[arg(long)]
+        deep: bool,
+    },
 
     /// Restore memories from backup file
     Restore {
@@ -52,7 +61,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Stats { tagging, states } => run_stats(tagging, states),
         Commands::Health => run_health(),
-        Commands::Consolidate => run_consolidate(),
+        Commands::Consolidate { deep } => run_consolidate(deep),
         Commands::Restore { file } => run_restore(file),
     }
 }
@@ -67,21 +76,49 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
 
     // Basic stats
     println!("{}: {}", "Total Memories".white().bold(), stats.total_nodes);
-    println!("{}: {}", "Due for Review".white().bold(), stats.nodes_due_for_review);
-    println!("{}: {:.1}%", "Average Retention".white().bold(), stats.average_retention * 100.0);
-    println!("{}: {:.2}", "Average Storage Strength".white().bold(), stats.average_storage_strength);
-    println!("{}: {:.2}", "Average Retrieval Strength".white().bold(), stats.average_retrieval_strength);
-    println!("{}: {}", "With Embeddings".white().bold(), stats.nodes_with_embeddings);
+    println!(
+        "{}: {}",
+        "Due for Review".white().bold(),
+        stats.nodes_due_for_review
+    );
+    println!(
+        "{}: {:.1}%",
+        "Average Retention".white().bold(),
+        stats.average_retention * 100.0
+    );
+    println!(
+        "{}: {:.2}",
+        "Average Storage Strength".white().bold(),
+        stats.average_storage_strength
+    );
+    println!(
+        "{}: {:.2}",
+        "Average Retrieval Strength".white().bold(),
+        stats.average_retrieval_strength
+    );
+    println!(
+        "{}: {}",
+        "With Embeddings".white().bold(),
+        stats.nodes_with_embeddings
+    );
 
     if let Some(model) = &stats.embedding_model {
         println!("{}: {}", "Embedding Model".white().bold(), model);
     }
 
     if let Some(oldest) = stats.oldest_memory {
-        println!("{}: {}", "Oldest Memory".white().bold(), oldest.format("%Y-%m-%d %H:%M:%S"));
+        println!(
+            "{}: {}",
+            "Oldest Memory".white().bold(),
+            oldest.format("%Y-%m-%d %H:%M:%S")
+        );
     }
     if let Some(newest) = stats.newest_memory {
-        println!("{}: {}", "Newest Memory".white().bold(), newest.format("%Y-%m-%d %H:%M:%S"));
+        println!(
+            "{}: {}",
+            "Newest Memory".white().bold(),
+            newest.format("%Y-%m-%d %H:%M:%S")
+        );
     }
 
     // Embedding coverage
@@ -90,7 +127,11 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
     } else {
         0.0
     };
-    println!("{}: {:.1}%", "Embedding Coverage".white().bold(), embedding_coverage);
+    println!(
+        "{}: {:.1}%",
+        "Embedding Coverage".white().bold(),
+        embedding_coverage
+    );
 
     // Tagging distribution (retention levels)
     if show_tagging {
@@ -101,9 +142,18 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
         let total = memories.len();
 
         if total > 0 {
-            let high = memories.iter().filter(|m| m.retention_strength >= 0.7).count();
-            let medium = memories.iter().filter(|m| m.retention_strength >= 0.4 && m.retention_strength < 0.7).count();
-            let low = memories.iter().filter(|m| m.retention_strength < 0.4).count();
+            let high = memories
+                .iter()
+                .filter(|m| m.retention_strength >= 0.7)
+                .count();
+            let medium = memories
+                .iter()
+                .filter(|m| m.retention_strength >= 0.4 && m.retention_strength < 0.7)
+                .count();
+            let low = memories
+                .iter()
+                .filter(|m| m.retention_strength < 0.4)
+                .count();
 
             print_distribution_bar("High (>=70%)", high, total, "green");
             print_distribution_bar("Medium (40-70%)", medium, total, "yellow");
@@ -116,7 +166,10 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
     // State distribution
     if show_states {
         println!();
-        println!("{}", "=== Cognitive State Distribution ===".magenta().bold());
+        println!(
+            "{}",
+            "=== Cognitive State Distribution ===".magenta().bold()
+        );
 
         let memories = storage.get_all_nodes(500, 0)?;
         let total = memories.len();
@@ -144,7 +197,9 @@ fn run_stats(show_tagging: bool, show_states: bool) -> anyhow::Result<()> {
 }
 
 /// Compute cognitive state distribution for memories
-fn compute_state_distribution(memories: &[vestige_core::KnowledgeNode]) -> (usize, usize, usize, usize) {
+fn compute_state_distribution(
+    memories: &[vestige_core::KnowledgeNode],
+) -> (usize, usize, usize, usize) {
     let mut active = 0;
     let mut dormant = 0;
     let mut silent = 0;
@@ -193,10 +248,7 @@ fn print_distribution_bar(label: &str, count: usize, total: usize, color: &str) 
 
     println!(
         "  {:15} [{:30}] {:>4} ({:>5.1}%)",
-        label,
-        colored_bar,
-        count,
-        percentage
+        label, colored_bar, count, percentage
     );
 }
 
@@ -228,8 +280,16 @@ fn run_health() -> anyhow::Result<()> {
 
     println!("{}: {}", "Status".white().bold(), colored_status);
     println!("{}: {}", "Total Memories".white(), stats.total_nodes);
-    println!("{}: {}", "Due for Review".white(), stats.nodes_due_for_review);
-    println!("{}: {:.1}%", "Average Retention".white(), stats.average_retention * 100.0);
+    println!(
+        "{}: {}",
+        "Due for Review".white(),
+        stats.nodes_due_for_review
+    );
+    println!(
+        "{}: {:.1}%",
+        "Average Retention".white(),
+        stats.average_retention * 100.0
+    );
 
     // Embedding coverage
     let embedding_coverage = if stats.total_nodes > 0 {
@@ -237,15 +297,27 @@ fn run_health() -> anyhow::Result<()> {
     } else {
         0.0
     };
-    println!("{}: {:.1}%", "Embedding Coverage".white(), embedding_coverage);
-    println!("{}: {}", "Embedding Service".white(),
-        if storage.is_embedding_ready() { "Ready".green() } else { "Not Ready".red() });
+    println!(
+        "{}: {:.1}%",
+        "Embedding Coverage".white(),
+        embedding_coverage
+    );
+    println!(
+        "{}: {}",
+        "Embedding Service".white(),
+        if storage.is_embedding_ready() {
+            "Ready".green()
+        } else {
+            "Not Ready".red()
+        }
+    );
 
     // Warnings
     let mut warnings = Vec::new();
 
     if stats.average_retention < 0.5 && stats.total_nodes > 0 {
-        warnings.push("Low average retention - consider running consolidation or reviewing memories");
+        warnings
+            .push("Low average retention - consider running consolidation or reviewing memories");
     }
 
     if stats.nodes_due_for_review > 10 {
@@ -272,7 +344,8 @@ fn run_health() -> anyhow::Result<()> {
     let mut recommendations = Vec::new();
 
     if status == "CRITICAL" {
-        recommendations.push("CRITICAL: Many memories have very low retention. Review important memories.");
+        recommendations
+            .push("CRITICAL: Many memories have very low retention. Review important memories.");
     }
 
     if stats.nodes_due_for_review > 5 {
@@ -280,7 +353,8 @@ fn run_health() -> anyhow::Result<()> {
     }
 
     if stats.nodes_with_embeddings < stats.total_nodes {
-        recommendations.push("Run 'vestige consolidate' to generate embeddings for better semantic search.");
+        recommendations
+            .push("Run 'vestige consolidate' to generate embeddings for better semantic search.");
     }
 
     if stats.total_nodes > 100 && stats.average_retention < 0.7 {
@@ -294,8 +368,16 @@ fn run_health() -> anyhow::Result<()> {
     println!();
     println!("{}", "Recommendations:".cyan().bold());
     for rec in &recommendations {
-        let icon = if rec.starts_with("CRITICAL") { "!".red().bold() } else { ">".cyan() };
-        let text = if rec.starts_with("CRITICAL") { rec.red().to_string() } else { rec.to_string() };
+        let icon = if rec.starts_with("CRITICAL") {
+            "!".red().bold()
+        } else {
+            ">".cyan()
+        };
+        let text = if rec.starts_with("CRITICAL") {
+            rec.red().to_string()
+        } else {
+            rec.to_string()
+        };
         println!("  {} {}", icon, text);
     }
 
@@ -303,7 +385,7 @@ fn run_health() -> anyhow::Result<()> {
 }
 
 /// Run consolidation cycle
-fn run_consolidate() -> anyhow::Result<()> {
+fn run_consolidate(deep: bool) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
     println!("Running memory consolidation cycle...");
@@ -312,12 +394,166 @@ fn run_consolidate() -> anyhow::Result<()> {
     let mut storage = Storage::new(None)?;
     let result = storage.run_consolidation()?;
 
-    println!("{}: {}", "Nodes Processed".white().bold(), result.nodes_processed);
-    println!("{}: {}", "Nodes Promoted".white().bold(), result.nodes_promoted);
+    println!(
+        "{}: {}",
+        "Nodes Processed".white().bold(),
+        result.nodes_processed
+    );
+    println!(
+        "{}: {}",
+        "Nodes Promoted".white().bold(),
+        result.nodes_promoted
+    );
     println!("{}: {}", "Nodes Pruned".white().bold(), result.nodes_pruned);
-    println!("{}: {}", "Decay Applied".white().bold(), result.decay_applied);
-    println!("{}: {}", "Embeddings Generated".white().bold(), result.embeddings_generated);
+    println!(
+        "{}: {}",
+        "Decay Applied".white().bold(),
+        result.decay_applied
+    );
+    println!(
+        "{}: {}",
+        "Embeddings Generated".white().bold(),
+        result.embeddings_generated
+    );
     println!("{}: {}ms", "Duration".white().bold(), result.duration_ms);
+
+    if deep {
+        println!();
+        println!(
+            "{}",
+            "=== Deep Consolidation (Dream Cycle) ===".magenta().bold()
+        );
+        println!();
+        println!("Loading memories for dream cycle...");
+
+        // Load all nodes from storage
+        let nodes = storage.get_all_nodes(5000, 0)?;
+        println!(
+            "  {} memories loaded",
+            nodes.len().to_string().white().bold()
+        );
+
+        // Convert KnowledgeNode -> DreamMemory
+        let dream_memories: Vec<DreamMemory> = nodes
+            .iter()
+            .map(|n| DreamMemory {
+                id: n.id.clone(),
+                content: n.content.clone(),
+                embedding: None, // Uses tag/word similarity fallback
+                tags: n.tags.clone(),
+                created_at: n.created_at,
+                access_count: n.reps.max(0) as u32,
+            })
+            .collect();
+
+        println!("  Running dream cycle (pairwise similarity analysis)...");
+
+        // MemoryDreamer::dream() is async, so we need a tokio runtime
+        let rt = tokio::runtime::Runtime::new()?;
+        let dreamer = MemoryDreamer::new();
+        let dream_result = rt.block_on(dreamer.dream(&dream_memories));
+
+        // Get discovered connections from the dreamer
+        let discovered_connections = dreamer.get_connections();
+
+        println!();
+        println!("{}", "--- Dream Results ---".yellow().bold());
+        println!(
+            "{}: {}",
+            "Memories Analyzed".white().bold(),
+            dream_result.stats.memories_analyzed
+        );
+        println!(
+            "{}: {}",
+            "Connections Evaluated".white().bold(),
+            dream_result.stats.connections_evaluated
+        );
+        println!(
+            "{}: {}",
+            "Connections Discovered".white().bold(),
+            dream_result.new_connections_found
+        );
+        println!(
+            "{}: {}",
+            "Clusters Found".white().bold(),
+            dream_result.stats.clusters_found
+        );
+        println!(
+            "{}: {}",
+            "Insights Generated".white().bold(),
+            dream_result.insights_generated.len()
+        );
+        println!(
+            "{}: {}ms",
+            "Dream Duration".white().bold(),
+            dream_result.duration_ms
+        );
+
+        // Persist discovered connections to the database
+        let mut connections_saved = 0;
+        for conn in &discovered_connections {
+            let now = Utc::now();
+            let record = ConnectionRecord {
+                source_id: conn.from_id.clone(),
+                target_id: conn.to_id.clone(),
+                strength: conn.similarity,
+                link_type: format!("{:?}", conn.connection_type),
+                created_at: now,
+                last_activated: now,
+                activation_count: 1,
+            };
+            if storage.save_connection(&record).is_ok() {
+                connections_saved += 1;
+            }
+        }
+
+        // Persist generated insights to the database
+        let mut insights_saved = 0;
+        for insight in &dream_result.insights_generated {
+            let record = InsightRecord {
+                id: insight.id.clone(),
+                insight: insight.insight.clone(),
+                source_memories: insight.source_memories.clone(),
+                confidence: insight.confidence,
+                novelty_score: insight.novelty_score,
+                insight_type: format!("{:?}", insight.insight_type),
+                generated_at: insight.generated_at,
+                tags: insight.tags.clone(),
+                feedback: None,
+                applied_count: 0,
+            };
+            if storage.save_insight(&record).is_ok() {
+                insights_saved += 1;
+            }
+        }
+
+        println!();
+        println!("{}", "--- Persisted ---".green().bold());
+        println!(
+            "{}: {}",
+            "Connections Saved".green().bold(),
+            connections_saved
+        );
+        println!("{}: {}", "Insights Saved".green().bold(), insights_saved);
+
+        // Display generated insights
+        if !dream_result.insights_generated.is_empty() {
+            println!();
+            println!("{}", "--- Insights ---".yellow().bold());
+            for (i, insight) in dream_result.insights_generated.iter().enumerate() {
+                println!(
+                    "  {}. {} {}",
+                    i + 1,
+                    insight.insight,
+                    format!(
+                        "(confidence: {:.2}, novelty: {:.2})",
+                        insight.confidence, insight.novelty_score
+                    )
+                    .dimmed()
+                );
+            }
+        }
+    }
 
     println!();
     println!(
@@ -419,7 +655,11 @@ fn run_restore(backup_path: PathBuf) -> anyhow::Result<()> {
     let stats = storage.get_stats()?;
     println!();
     println!("{}: {}", "Total Nodes".white(), stats.total_nodes);
-    println!("{}: {}", "With Embeddings".white(), stats.nodes_with_embeddings);
+    println!(
+        "{}: {}",
+        "With Embeddings".white(),
+        stats.nodes_with_embeddings
+    );
 
     Ok(())
 }

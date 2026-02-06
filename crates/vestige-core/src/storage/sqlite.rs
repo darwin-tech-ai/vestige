@@ -263,10 +263,7 @@ impl Storage {
     ///
     /// This solves the "bad vs good similar memory" problem.
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    pub fn smart_ingest(
-        &mut self,
-        input: IngestInput,
-    ) -> Result<SmartIngestResult> {
+    pub fn smart_ingest(&mut self, input: IngestInput) -> Result<SmartIngestResult> {
         use crate::advanced::prediction_error::{
             CandidateMemory, GateDecision, PredictionErrorGate, UpdateType,
         };
@@ -323,7 +320,12 @@ impl Storage {
         let decision = gate.evaluate(&input.content, &new_embedding.vector, &candidates);
 
         match decision {
-            GateDecision::Create { prediction_error, related_memory_ids, reason, .. } => {
+            GateDecision::Create {
+                prediction_error,
+                related_memory_ids,
+                reason,
+                ..
+            } => {
                 // Create new memory
                 let node = self.ingest(input)?;
                 Ok(SmartIngestResult {
@@ -332,15 +334,24 @@ impl Storage {
                     superseded_id: None,
                     similarity: None,
                     prediction_error: Some(prediction_error),
-                    reason: format!("Created new memory: {:?}. Related: {:?}", reason, related_memory_ids),
+                    reason: format!(
+                        "Created new memory: {:?}. Related: {:?}",
+                        reason, related_memory_ids
+                    ),
                 })
             }
-            GateDecision::Update { target_id, similarity, update_type, prediction_error } => {
+            GateDecision::Update {
+                target_id,
+                similarity,
+                update_type,
+                prediction_error,
+            } => {
                 match update_type {
                     UpdateType::Reinforce => {
                         // Just strengthen the existing memory
                         self.strengthen_on_access(&target_id)?;
-                        let node = self.get_node(&target_id)?
+                        let node = self
+                            .get_node(&target_id)?
                             .ok_or_else(|| StorageError::NotFound(target_id.clone()))?;
                         Ok(SmartIngestResult {
                             decision: "reinforce".to_string(),
@@ -348,12 +359,14 @@ impl Storage {
                             superseded_id: None,
                             similarity: Some(similarity),
                             prediction_error: Some(prediction_error),
-                            reason: "Content nearly identical - reinforced existing memory".to_string(),
+                            reason: "Content nearly identical - reinforced existing memory"
+                                .to_string(),
                         })
                     }
                     UpdateType::Merge | UpdateType::Append => {
                         // Update the existing memory with merged content
-                        let existing = self.get_node(&target_id)?
+                        let existing = self
+                            .get_node(&target_id)?
                             .ok_or_else(|| StorageError::NotFound(target_id.clone()))?;
 
                         let merged_content = format!(
@@ -366,7 +379,8 @@ impl Storage {
                         self.update_node_content(&target_id, &merged_content)?;
                         self.strengthen_on_access(&target_id)?;
 
-                        let node = self.get_node(&target_id)?
+                        let node = self
+                            .get_node(&target_id)?
                             .ok_or_else(|| StorageError::NotFound(target_id.clone()))?;
 
                         Ok(SmartIngestResult {
@@ -381,7 +395,8 @@ impl Storage {
                     UpdateType::Replace => {
                         // Replace content entirely
                         self.update_node_content(&target_id, &input.content)?;
-                        let node = self.get_node(&target_id)?
+                        let node = self
+                            .get_node(&target_id)?
                             .ok_or_else(|| StorageError::NotFound(target_id.clone()))?;
 
                         Ok(SmartIngestResult {
@@ -395,17 +410,16 @@ impl Storage {
                     }
                     UpdateType::AddContext => {
                         // Add as context without modifying main content
-                        let existing = self.get_node(&target_id)?
+                        let existing = self
+                            .get_node(&target_id)?
                             .ok_or_else(|| StorageError::NotFound(target_id.clone()))?;
 
-                        let merged_content = format!(
-                            "{}\n\n---\nContext: {}",
-                            existing.content,
-                            input.content
-                        );
+                        let merged_content =
+                            format!("{}\n\n---\nContext: {}", existing.content, input.content);
 
                         self.update_node_content(&target_id, &merged_content)?;
-                        let node = self.get_node(&target_id)?
+                        let node = self
+                            .get_node(&target_id)?
                             .ok_or_else(|| StorageError::NotFound(target_id.clone()))?;
 
                         Ok(SmartIngestResult {
@@ -419,7 +433,12 @@ impl Storage {
                     }
                 }
             }
-            GateDecision::Supersede { old_memory_id, similarity, supersede_reason, prediction_error } => {
+            GateDecision::Supersede {
+                old_memory_id,
+                similarity,
+                supersede_reason,
+                prediction_error,
+            } => {
                 // Demote the old memory and create new
                 self.demote_memory(&old_memory_id)?;
 
@@ -435,7 +454,11 @@ impl Storage {
                     reason: format!("New memory supersedes old: {:?}", supersede_reason),
                 })
             }
-            GateDecision::Merge { memory_ids, avg_similarity, strategy } => {
+            GateDecision::Merge {
+                memory_ids,
+                avg_similarity,
+                strategy,
+            } => {
                 // For now, create new and link to existing
                 let node = self.ingest(input)?;
 
@@ -445,7 +468,11 @@ impl Storage {
                     superseded_id: None,
                     similarity: Some(avg_similarity),
                     prediction_error: Some(1.0 - avg_similarity),
-                    reason: format!("Created new memory linked to {} similar memories ({:?})", memory_ids.len(), strategy),
+                    reason: format!(
+                        "Created new memory linked to {} similar memories ({:?})",
+                        memory_ids.len(),
+                        strategy
+                    ),
                 })
             }
         }
@@ -453,18 +480,17 @@ impl Storage {
 
     /// Get the embedding vector for a node
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
-    fn get_node_embedding(&self, node_id: &str) -> Result<Option<Vec<f32>>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT embedding FROM node_embeddings WHERE node_id = ?1"
-        )?;
+    pub fn get_node_embedding(&self, node_id: &str) -> Result<Option<Vec<f32>>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT embedding FROM node_embeddings WHERE node_id = ?1")?;
 
         let embedding_bytes: Option<Vec<u8>> = stmt
             .query_row(params![node_id], |row| row.get(0))
             .optional()?;
 
-        Ok(embedding_bytes.and_then(|bytes| {
-            crate::embeddings::Embedding::from_bytes(&bytes).map(|e| e.vector)
-        }))
+        Ok(embedding_bytes
+            .and_then(|bytes| crate::embeddings::Embedding::from_bytes(&bytes).map(|e| e.vector)))
     }
 
     /// Update the content of an existing node
@@ -1047,7 +1073,8 @@ impl Storage {
                      ORDER BY retention_strength DESC, created_at DESC
                      LIMIT ?2",
                 )?;
-                let rows = stmt.query_map(params![node_type, limit], |row| self.row_to_node(row))?;
+                let rows =
+                    stmt.query_map(params![node_type, limit], |row| self.row_to_node(row))?;
                 let mut nodes = Vec::new();
                 for node in rows.flatten() {
                     nodes.push(node);
@@ -1087,7 +1114,9 @@ impl Storage {
     fn get_query_embedding(&self, query: &str) -> Result<Vec<f32>> {
         // Check cache first
         {
-            let mut cache = self.query_cache.lock()
+            let mut cache = self
+                .query_cache
+                .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
             if let Some(cached) = cache.get(query) {
                 return Ok(cached.clone());
@@ -1095,12 +1124,16 @@ impl Storage {
         }
 
         // Not in cache, compute embedding
-        let embedding = self.embedding_service.embed(query)
+        let embedding = self
+            .embedding_service
+            .embed(query)
             .map_err(|e| StorageError::Init(format!("Failed to embed query: {}", e)))?;
 
         // Store in cache
         {
-            let mut cache = self.query_cache.lock()
+            let mut cache = self
+                .query_cache
+                .lock()
                 .map_err(|_| StorageError::Init("Query cache lock poisoned".to_string()))?;
             cache.put(query.to_string(), embedding.vector.clone());
         }
@@ -1567,7 +1600,7 @@ pub struct IntentionRecord {
     pub id: String,
     pub content: String,
     pub trigger_type: String,
-    pub trigger_data: String,  // JSON
+    pub trigger_data: String, // JSON
     pub priority: i32,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -1631,7 +1664,7 @@ pub struct ConnectionRecord {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct MemoryStateRecord {
     pub memory_id: String,
-    pub state: String,  // 'active', 'dormant', 'silent', 'unavailable'
+    pub state: String, // 'active', 'dormant', 'silent', 'unavailable'
     pub last_access: DateTime<Utc>,
     pub access_count: i32,
     pub state_entered_at: DateTime<Utc>,
@@ -1672,7 +1705,8 @@ impl Storage {
     /// Save an intention to the database
     pub fn save_intention(&mut self, intention: &IntentionRecord) -> Result<()> {
         let tags_json = serde_json::to_string(&intention.tags).unwrap_or_else(|_| "[]".to_string());
-        let related_json = serde_json::to_string(&intention.related_memories).unwrap_or_else(|_| "[]".to_string());
+        let related_json =
+            serde_json::to_string(&intention.related_memories).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
             "INSERT OR REPLACE INTO intentions (
@@ -1705,9 +1739,9 @@ impl Storage {
 
     /// Get an intention by ID
     pub fn get_intention(&self, id: &str) -> Result<Option<IntentionRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM intentions WHERE id = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM intentions WHERE id = ?1")?;
 
         stmt.query_row(params![id], |row| self.row_to_intention(row))
             .optional()
@@ -1731,7 +1765,7 @@ impl Storage {
     /// Get intentions by status
     pub fn get_intentions_by_status(&self, status: &str) -> Result<Vec<IntentionRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT * FROM intentions WHERE status = ?1 ORDER BY priority DESC, created_at ASC"
+            "SELECT * FROM intentions WHERE status = ?1 ORDER BY priority DESC, created_at ASC",
         )?;
 
         let rows = stmt.query_map(params![status], |row| self.row_to_intention(row))?;
@@ -1745,7 +1779,11 @@ impl Storage {
     /// Update intention status
     pub fn update_intention_status(&mut self, id: &str, status: &str) -> Result<bool> {
         let now = Utc::now();
-        let fulfilled_at = if status == "fulfilled" { Some(now.to_rfc3339()) } else { None };
+        let fulfilled_at = if status == "fulfilled" {
+            Some(now.to_rfc3339())
+        } else {
+            None
+        };
 
         let rows = self.conn.execute(
             "UPDATE intentions SET status = ?1, fulfilled_at = ?2 WHERE id = ?3",
@@ -1756,7 +1794,9 @@ impl Storage {
 
     /// Delete an intention
     pub fn delete_intention(&mut self, id: &str) -> Result<bool> {
-        let rows = self.conn.execute("DELETE FROM intentions WHERE id = ?1", params![id])?;
+        let rows = self
+            .conn
+            .execute("DELETE FROM intentions WHERE id = ?1", params![id])?;
         Ok(rows > 0)
     }
 
@@ -1791,7 +1831,11 @@ impl Storage {
         let related: Vec<String> = serde_json::from_str(&related_json).unwrap_or_default();
 
         let parse_opt_dt = |s: Option<String>| -> Option<DateTime<Utc>> {
-            s.and_then(|v| DateTime::parse_from_rfc3339(&v).ok().map(|dt| dt.with_timezone(&Utc)))
+            s.and_then(|v| {
+                DateTime::parse_from_rfc3339(&v)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
         };
 
         Ok(IntentionRecord {
@@ -1823,7 +1867,8 @@ impl Storage {
 
     /// Save an insight to the database
     pub fn save_insight(&mut self, insight: &InsightRecord) -> Result<()> {
-        let source_json = serde_json::to_string(&insight.source_memories).unwrap_or_else(|_| "[]".to_string());
+        let source_json =
+            serde_json::to_string(&insight.source_memories).unwrap_or_else(|_| "[]".to_string());
         let tags_json = serde_json::to_string(&insight.tags).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
@@ -1849,9 +1894,9 @@ impl Storage {
 
     /// Get insights with optional limit
     pub fn get_insights(&self, limit: i32) -> Result<Vec<InsightRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM insights ORDER BY generated_at DESC LIMIT ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM insights ORDER BY generated_at DESC LIMIT ?1")?;
 
         let rows = stmt.query_map(params![limit], |row| self.row_to_insight(row))?;
         let mut result = Vec::new();
@@ -1863,9 +1908,9 @@ impl Storage {
 
     /// Get insights without feedback (pending review)
     pub fn get_pending_insights(&self) -> Result<Vec<InsightRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM insights WHERE feedback IS NULL ORDER BY novelty_score DESC"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM insights WHERE feedback IS NULL ORDER BY novelty_score DESC")?;
 
         let rows = stmt.query_map([], |row| self.row_to_insight(row))?;
         let mut result = Vec::new();
@@ -1886,7 +1931,9 @@ impl Storage {
 
     /// Clear all insights
     pub fn clear_insights(&mut self) -> Result<i32> {
-        let count: i32 = self.conn.query_row("SELECT COUNT(*) FROM insights", [], |row| row.get(0))?;
+        let count: i32 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM insights", [], |row| row.get(0))?;
         self.conn.execute("DELETE FROM insights", [])?;
         Ok(count)
     }
@@ -1952,9 +1999,9 @@ impl Storage {
 
     /// Get all connections (for building activation network)
     pub fn get_all_connections(&self) -> Result<Vec<ConnectionRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM memory_connections ORDER BY strength DESC"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM memory_connections ORDER BY strength DESC")?;
 
         let rows = stmt.query_map([], |row| self.row_to_connection(row))?;
         let mut result = Vec::new();
@@ -1965,7 +2012,12 @@ impl Storage {
     }
 
     /// Strengthen a connection
-    pub fn strengthen_connection(&mut self, source_id: &str, target_id: &str, boost: f64) -> Result<bool> {
+    pub fn strengthen_connection(
+        &mut self,
+        source_id: &str,
+        target_id: &str,
+        boost: f64,
+    ) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let rows = self.conn.execute(
             "UPDATE memory_connections SET
@@ -2018,7 +2070,8 @@ impl Storage {
 
     /// Save or update memory state
     pub fn save_memory_state(&mut self, state: &MemoryStateRecord) -> Result<()> {
-        let suppressed_json = serde_json::to_string(&state.suppressed_by).unwrap_or_else(|_| "[]".to_string());
+        let suppressed_json =
+            serde_json::to_string(&state.suppressed_by).unwrap_or_else(|_| "[]".to_string());
 
         self.conn.execute(
             "INSERT OR REPLACE INTO memory_states (
@@ -2040,9 +2093,9 @@ impl Storage {
 
     /// Get memory state
     pub fn get_memory_state(&self, memory_id: &str) -> Result<Option<MemoryStateRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM memory_states WHERE memory_id = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM memory_states WHERE memory_id = ?1")?;
 
         stmt.query_row(params![memory_id], |row| self.row_to_memory_state(row))
             .optional()
@@ -2051,9 +2104,9 @@ impl Storage {
 
     /// Get memories by state
     pub fn get_memories_by_state(&self, state: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT memory_id FROM memory_states WHERE state = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT memory_id FROM memory_states WHERE state = ?1")?;
 
         let rows = stmt.query_map(params![state], |row| row.get::<_, String>(0))?;
         let mut result = Vec::new();
@@ -2064,7 +2117,12 @@ impl Storage {
     }
 
     /// Update memory state
-    pub fn update_memory_state(&mut self, memory_id: &str, new_state: &str, reason: &str) -> Result<bool> {
+    pub fn update_memory_state(
+        &mut self,
+        memory_id: &str,
+        new_state: &str,
+        reason: &str,
+    ) -> Result<bool> {
         let now = Utc::now();
 
         // Get old state for transition record
@@ -2120,7 +2178,11 @@ impl Storage {
         let suppressed_by: Vec<String> = serde_json::from_str(&suppressed_json).unwrap_or_default();
 
         let parse_opt_dt = |s: Option<String>| -> Option<DateTime<Utc>> {
-            s.and_then(|v| DateTime::parse_from_rfc3339(&v).ok().map(|dt| dt.with_timezone(&Utc)))
+            s.and_then(|v| {
+                DateTime::parse_from_rfc3339(&v)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&Utc))
+            })
         };
 
         Ok(MemoryStateRecord {
@@ -2130,9 +2192,11 @@ impl Storage {
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now()),
             access_count: row.get("access_count").unwrap_or(1),
-            state_entered_at: DateTime::parse_from_rfc3339(&row.get::<_, String>("state_entered_at")?)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+            state_entered_at: DateTime::parse_from_rfc3339(
+                &row.get::<_, String>("state_entered_at")?,
+            )
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
             suppression_until: parse_opt_dt(row.get("suppression_until").ok().flatten()),
             suppressed_by,
         })
@@ -2143,7 +2207,10 @@ impl Storage {
     // ========================================================================
 
     /// Save consolidation history record
-    pub fn save_consolidation_history(&mut self, record: &ConsolidationHistoryRecord) -> Result<i64> {
+    pub fn save_consolidation_history(
+        &mut self,
+        record: &ConsolidationHistoryRecord,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO consolidation_history (
                 completed_at, duration_ms, memories_replayed, connections_found,
@@ -2164,22 +2231,28 @@ impl Storage {
 
     /// Get last consolidation timestamp
     pub fn get_last_consolidation(&self) -> Result<Option<DateTime<Utc>>> {
-        let result: Option<String> = self.conn.query_row(
-            "SELECT MAX(completed_at) FROM consolidation_history",
-            [],
-            |row| row.get(0),
-        ).ok().flatten();
+        let result: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT MAX(completed_at) FROM consolidation_history",
+                [],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
 
         Ok(result.and_then(|s| {
-            DateTime::parse_from_rfc3339(&s).ok().map(|dt| dt.with_timezone(&Utc))
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
         }))
     }
 
     /// Get consolidation history
     pub fn get_consolidation_history(&self, limit: i32) -> Result<Vec<ConsolidationHistoryRecord>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT * FROM consolidation_history ORDER BY completed_at DESC LIMIT ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM consolidation_history ORDER BY completed_at DESC LIMIT ?1")?;
 
         let rows = stmt.query_map(params![limit], |row| {
             Ok(ConsolidationHistoryRecord {
@@ -2208,9 +2281,13 @@ impl Storage {
     // ========================================================================
 
     /// Get state transitions for a memory
-    pub fn get_state_transitions(&self, memory_id: &str, limit: i32) -> Result<Vec<StateTransitionRecord>> {
+    pub fn get_state_transitions(
+        &self,
+        memory_id: &str,
+        limit: i32,
+    ) -> Result<Vec<StateTransitionRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT * FROM state_transitions WHERE memory_id = ?1 ORDER BY timestamp DESC LIMIT ?2"
+            "SELECT * FROM state_transitions WHERE memory_id = ?1 ORDER BY timestamp DESC LIMIT ?2",
         )?;
 
         let rows = stmt.query_map(params![memory_id, limit], |row| {

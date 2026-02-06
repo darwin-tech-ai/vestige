@@ -8,7 +8,7 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use vestige_core::{
-    ConnectionRecord, DreamMemory, IngestInput, InsightRecord, MemoryDreamer, Storage,
+    ConnectionRecord, DreamConfig, DreamMemory, IngestInput, InsightRecord, MemoryDreamer, Storage,
 };
 
 /// Vestige - Cognitive Memory System CLI
@@ -46,6 +46,10 @@ enum Commands {
         /// Run deep consolidation: dream cycle with connection discovery and insight generation
         #[arg(long)]
         deep: bool,
+
+        /// Minimum similarity threshold for connection discovery (0.0-1.0, default: 0.85)
+        #[arg(long, default_value = "0.85")]
+        min_similarity: f64,
     },
 
     /// Restore memories from backup file
@@ -61,7 +65,10 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Stats { tagging, states } => run_stats(tagging, states),
         Commands::Health => run_health(),
-        Commands::Consolidate { deep } => run_consolidate(deep),
+        Commands::Consolidate {
+            deep,
+            min_similarity,
+        } => run_consolidate(deep, min_similarity),
         Commands::Restore { file } => run_restore(file),
     }
 }
@@ -385,7 +392,7 @@ fn run_health() -> anyhow::Result<()> {
 }
 
 /// Run consolidation cycle
-fn run_consolidate(deep: bool) -> anyhow::Result<()> {
+fn run_consolidate(deep: bool, min_similarity: f64) -> anyhow::Result<()> {
     println!("{}", "=== Vestige Consolidation ===".cyan().bold());
     println!();
     println!("Running memory consolidation cycle...");
@@ -433,24 +440,51 @@ fn run_consolidate(deep: bool) -> anyhow::Result<()> {
             nodes.len().to_string().white().bold()
         );
 
-        // Convert KnowledgeNode -> DreamMemory
+        // Convert KnowledgeNode -> DreamMemory with embeddings for semantic similarity
+        println!("  Loading embeddings for semantic similarity...");
+        let mut embeddings_loaded = 0usize;
         let dream_memories: Vec<DreamMemory> = nodes
             .iter()
-            .map(|n| DreamMemory {
-                id: n.id.clone(),
-                content: n.content.clone(),
-                embedding: None, // Uses tag/word similarity fallback
-                tags: n.tags.clone(),
-                created_at: n.created_at,
-                access_count: n.reps.max(0) as u32,
+            .map(|n| {
+                let embedding = storage.get_node_embedding(&n.id).ok().flatten();
+                if embedding.is_some() {
+                    embeddings_loaded += 1;
+                }
+                DreamMemory {
+                    id: n.id.clone(),
+                    content: n.content.clone(),
+                    embedding,
+                    tags: n.tags.clone(),
+                    created_at: n.created_at,
+                    access_count: n.reps.max(0) as u32,
+                }
             })
             .collect();
 
-        println!("  Running dream cycle (pairwise similarity analysis)...");
+        println!(
+            "  {} embeddings loaded ({:.0}% coverage)",
+            embeddings_loaded.to_string().white().bold(),
+            if nodes.is_empty() {
+                0.0
+            } else {
+                embeddings_loaded as f64 / nodes.len() as f64 * 100.0
+            }
+        );
+        println!("  Running dream cycle (semantic pairwise similarity)...");
+
+        // Configure dream cycle with custom similarity threshold
+        let config = DreamConfig {
+            min_similarity,
+            ..DreamConfig::default()
+        };
+        println!(
+            "  Similarity threshold: {}",
+            format!("{:.2}", min_similarity).white().bold()
+        );
 
         // MemoryDreamer::dream() is async, so we need a tokio runtime
         let rt = tokio::runtime::Runtime::new()?;
-        let dreamer = MemoryDreamer::new();
+        let dreamer = MemoryDreamer::with_config(config);
         let dream_result = rt.block_on(dreamer.dream(&dream_memories));
 
         // Get discovered connections from the dreamer

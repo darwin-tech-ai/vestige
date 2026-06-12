@@ -65,10 +65,97 @@ pub enum StorageError {
     /// Initialization error
     #[error("Initialization error: {0}")]
     Init(String),
+    /// Rejected path (failed backup/restore containment guard)
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
 }
 
 /// Storage result type
 pub type Result<T> = std::result::Result<T, StorageError>;
+
+/// Validate that a caller-supplied backup/restore path resolves inside one of
+/// the `allowed_roots`, rejecting `..` traversal and absolute paths that escape
+/// the allowlist.
+///
+/// Portable-archive import/export paths originate from MCP tool arguments (i.e.
+/// an LLM) and must never be allowed to read or overwrite arbitrary files the
+/// process can access.
+///
+/// `must_exist` distinguishes the two sides:
+/// - read/import (`true`): the file must already exist, so the whole path is
+///   canonicalized (which also resolves symlinks, blocking symlink escapes).
+/// - write/export (`false`): the file may not exist yet, so only the parent
+///   directory is canonicalized and the final path component must be a plain
+///   file name (rejecting `..`, `.`, and a bare directory/root).
+///
+/// Returns the canonicalized, contained path on success.
+pub(crate) fn resolve_backup_path_within(
+    path: &Path,
+    allowed_roots: &[PathBuf],
+    must_exist: bool,
+) -> Result<PathBuf> {
+    if allowed_roots.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "no allowed backup directory configured".to_string(),
+        ));
+    }
+
+    // Canonicalize the allowed roots up front (they must exist on disk). Roots
+    // that cannot be resolved are skipped rather than failing the whole check.
+    let canonical_roots: Vec<PathBuf> = allowed_roots
+        .iter()
+        .filter_map(|root| std::fs::canonicalize(root).ok())
+        .collect();
+    if canonical_roots.is_empty() {
+        return Err(StorageError::InvalidPath(
+            "no allowed backup directory exists on disk".to_string(),
+        ));
+    }
+
+    let resolved = if must_exist {
+        std::fs::canonicalize(path).map_err(|e| {
+            StorageError::InvalidPath(format!(
+                "cannot resolve backup path '{}': {}",
+                path.display(),
+                e
+            ))
+        })?
+    } else {
+        // The target file may not exist yet, so canonicalize the parent dir and
+        // re-append the final component. The final component must be a plain
+        // file name — anything else (`..`, `.`, root) is rejected outright.
+        let file_name = match path.components().next_back() {
+            Some(Component::Normal(name)) => name.to_owned(),
+            _ => {
+                return Err(StorageError::InvalidPath(format!(
+                    "backup path '{}' must end in a file name",
+                    path.display()
+                )))
+            }
+        };
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|e| {
+            StorageError::InvalidPath(format!(
+                "cannot resolve backup directory '{}': {}",
+                parent.display(),
+                e
+            ))
+        })?;
+        canonical_parent.join(file_name)
+    };
+
+    if canonical_roots.iter().any(|root| resolved.starts_with(root)) {
+        Ok(resolved)
+    } else {
+        Err(StorageError::InvalidPath(format!(
+            "backup path '{}' resolves outside the allowed backup directory",
+            path.display()
+        )))
+    }
+}
 
 /// Result of smart ingest with prediction error gating
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -287,6 +374,8 @@ struct PortableMergeState {
 
 const DATA_DIR_ENV: &str = "VESTIGE_DATA_DIR";
 const DATABASE_FILE: &str = "vestige.db";
+/// Optional extra allowlisted directory for portable-archive backup/restore.
+const BACKUP_DIR_ENV: &str = "VESTIGE_BACKUP_DIR";
 
 /// Main storage struct with integrated embedding and vector search
 ///
@@ -468,6 +557,23 @@ impl Storage {
     /// Data directory containing the SQLite database and sidecar folders.
     pub fn data_dir(&self) -> &Path {
         self.db_path.parent().unwrap_or_else(|| Path::new("."))
+    }
+
+    /// Directories a portable-archive backup/restore path is allowed to touch:
+    /// this instance's data dir, plus an optional explicitly configured
+    /// `VESTIGE_BACKUP_DIR`.
+    fn allowed_backup_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.data_dir().to_path_buf()];
+        if let Some(dir) = std::env::var_os(BACKUP_DIR_ENV).filter(|dir| !dir.is_empty()) {
+            roots.push(Self::expand_tilde(PathBuf::from(dir)));
+        }
+        roots
+    }
+
+    /// Validate a caller-supplied portable-archive path against the allowed
+    /// backup roots. See [`resolve_backup_path_within`].
+    fn guard_backup_path(&self, path: &Path, must_exist: bool) -> Result<PathBuf> {
+        resolve_backup_path_within(path, &self.allowed_backup_roots(), must_exist)
     }
 
     /// Sidecar directory for files belonging to this storage instance.
@@ -4805,10 +4911,17 @@ impl Storage {
     }
 
     /// Write an exact portable archive to a JSON file.
+    ///
+    /// The caller-supplied `path` originates from MCP tool arguments, so it is
+    /// validated against this instance's allowed backup roots before any write.
     pub fn export_portable_archive_to_path(
         &self,
         path: &std::path::Path,
     ) -> Result<PortableArchive> {
+        // Containment guard: reject `..` traversal / out-of-allowlist targets and
+        // resolve to a canonical, contained path before touching the filesystem.
+        let safe_path = self.guard_backup_path(path, false)?;
+        let path: &Path = &safe_path;
         let archive = self.export_portable_archive()?;
         let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
         let filename = path
@@ -4827,6 +4940,9 @@ impl Storage {
                 .open(&temp_path)?
         };
         #[cfg(not(unix))]
+        // `temp_path` derives from `safe_path`, already canonicalized and
+        // confined to an allowed backup root by `guard_backup_path` above.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
         let mut file = std::fs::File::create(&temp_path)?;
         if let Err(e) = serde_json::to_writer_pretty(&mut file, &archive) {
             let _ = std::fs::remove_file(&temp_path);
@@ -5028,12 +5144,21 @@ impl Storage {
     }
 
     /// Read and import an exact portable archive JSON file.
+    ///
+    /// The caller-supplied `path` originates from MCP tool arguments, so it is
+    /// validated against this instance's allowed backup roots before it is read.
     pub fn import_portable_archive_from_path(
         &self,
         path: &std::path::Path,
         mode: PortableImportMode,
     ) -> Result<PortableImportReport> {
-        let file = std::fs::File::open(path)?;
+        // Containment guard: reject `..` traversal and out-of-allowlist targets,
+        // resolving to a canonical, contained path before opening the file.
+        let safe_path = self.guard_backup_path(path, true)?;
+        // `safe_path` is canonicalized and confined to an allowed backup root by
+        // the guard above, so it is no longer attacker-controlled.
+        // nosemgrep: rust.actix.path-traversal.tainted-path.tainted-path
+        let file = std::fs::File::open(&safe_path)?;
         let archive: PortableArchive = serde_json::from_reader(file)
             .map_err(|e| StorageError::Init(format!("Failed to parse portable archive: {}", e)))?;
         self.import_portable_archive(&archive, mode)
@@ -6201,6 +6326,120 @@ mod tests {
 
     fn create_test_storage_at(dir: &tempfile::TempDir, name: &str) -> Storage {
         Storage::new(Some(dir.path().join(name))).unwrap()
+    }
+
+    // ---- backup/restore path containment guard ----
+
+    #[test]
+    fn test_export_rejects_path_outside_data_dir() {
+        let data_dir = tempdir().unwrap();
+        let storage = create_test_storage_at(&data_dir, "vestige.db");
+
+        // Absolute path in an unrelated directory, outside the allowlist.
+        let outside = tempdir().unwrap();
+        let escape = outside.path().join("stolen.json");
+        let err = storage
+            .export_portable_archive_to_path(&escape)
+            .expect_err("export outside the data dir must be rejected");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+        assert!(
+            !escape.exists(),
+            "no file may be written outside the allowlist"
+        );
+    }
+
+    #[test]
+    fn test_export_rejects_dotdot_traversal() {
+        let data_dir = tempdir().unwrap();
+        let storage = create_test_storage_at(&data_dir, "vestige.db");
+
+        // `<data_dir>/../escape.json` resolves to a sibling of the data dir.
+        let escape = data_dir.path().join("..").join("escape.json");
+        let err = storage
+            .export_portable_archive_to_path(&escape)
+            .expect_err("`..` traversal must be rejected");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn test_import_rejects_path_outside_data_dir() {
+        let data_dir = tempdir().unwrap();
+        let storage = create_test_storage_at(&data_dir, "vestige.db");
+
+        // A real file outside the data dir must not be readable via restore.
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret.json");
+        std::fs::write(&secret, b"{}").unwrap();
+        let err = storage
+            .import_portable_archive_from_path(&secret, PortableImportMode::EmptyOnly)
+            .expect_err("import outside the data dir must be rejected");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+    }
+
+    #[test]
+    fn test_import_rejects_dotdot_traversal() {
+        let data_dir = tempdir().unwrap();
+        let storage = create_test_storage_at(&data_dir, "vestige.db");
+
+        let escape = data_dir.path().join("..").join("secret.json");
+        // Even if the target exists, `..` escaping the data dir is rejected.
+        std::fs::write(data_dir.path().join("../secret.json"), b"{}").ok();
+        let err = storage
+            .import_portable_archive_from_path(&escape, PortableImportMode::EmptyOnly)
+            .expect_err("`..` traversal must be rejected");
+        assert!(matches!(err, StorageError::InvalidPath(_)));
+        let _ = std::fs::remove_file(data_dir.path().join("../secret.json"));
+    }
+
+    #[test]
+    fn test_backup_round_trips_inside_data_dir() {
+        // A path inside the data dir is accepted on both sides.
+        let src_dir = tempdir().unwrap();
+        let source = create_test_storage_at(&src_dir, "vestige.db");
+        let archive_path = source.sidecar_dir("backups").join("snapshot.json");
+        std::fs::create_dir_all(archive_path.parent().unwrap()).unwrap();
+        source
+            .export_portable_archive_to_path(&archive_path)
+            .expect("in-data-dir export should succeed");
+        assert!(archive_path.exists());
+
+        // Restore it from inside the destination's data dir.
+        let dst_dir = tempdir().unwrap();
+        let dest = create_test_storage_at(&dst_dir, "vestige.db");
+        let restore_path = dst_dir.path().join("snapshot.json");
+        std::fs::copy(&archive_path, &restore_path).unwrap();
+        dest.import_portable_archive_from_path(&restore_path, PortableImportMode::EmptyOnly)
+            .expect("in-data-dir import should succeed");
+    }
+
+    #[test]
+    fn test_backup_guard_helper_rejections() {
+        // Direct unit tests on the guard, mirroring the helper kept on `main`.
+        let dir = tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Accept a normal file inside the root (write side, may not exist yet).
+        let inside = root.join("ok.json");
+        assert!(resolve_backup_path_within(&inside, std::slice::from_ref(&root), false).is_ok());
+
+        // Reject an empty allowlist.
+        assert!(matches!(
+            resolve_backup_path_within(&inside, &[], false),
+            Err(StorageError::InvalidPath(_))
+        ));
+
+        // Reject a path whose final component is not a plain file name.
+        let no_name = root.join("sub").join("..");
+        assert!(matches!(
+            resolve_backup_path_within(&no_name, std::slice::from_ref(&root), false),
+            Err(StorageError::InvalidPath(_))
+        ));
+
+        // Reject an absolute system path on the write side.
+        assert!(matches!(
+            resolve_backup_path_within(Path::new("/etc/passwd"), std::slice::from_ref(&root), false),
+            Err(StorageError::InvalidPath(_))
+        ));
     }
 
     #[cfg(all(feature = "embeddings", feature = "vector-search"))]
